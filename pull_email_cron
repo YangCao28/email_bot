@@ -1,0 +1,2 @@
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root /usr/local/bin/python /app/pull_email.py >> /proc/1/fd/1 2>&1
