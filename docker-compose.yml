@@ -1,19 +1,31 @@
-version: "3.8"
-
 services:
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+
   pull_email:
     image: yc403/email_bot-pull_email:latest
     container_name: pull_email
     env_file:
       - .env
-    network_mode: "host"
+    depends_on:
+      - redis
     restart: always
-    # 默认docker-compose日志就是收集stdout/stderr，这里不需要特别配置
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - AI_API_URL=http://129.226.227.24:8080/generate
 
   process_response:
     image: yc403/email_bot-process_response:latest
     container_name: process_response
     env_file:
       - .env
-    network_mode: "host"
+    depends_on:
+      - redis
     restart: always
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - AI_API_URL=http://129.226.227.24:8080/generate
