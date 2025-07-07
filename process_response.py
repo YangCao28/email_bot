@@ -28,7 +28,6 @@ from dotenv import load_dotenv
 from email.mime.text import MIMEText
 from requests.adapters import HTTPAdapter, Retry
 
-# ========== 日志配置 ==========
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -36,7 +35,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== 全局配置 & 读取 .env ==========
 MAX_RETRIES = 3
 RETRY_INTERVAL = 5  # seconds between retries
 
@@ -58,10 +56,8 @@ DB_CONFIG = dict(
     charset='utf8mb4'
 )
 
-# --- Rate‑limit window (seconds) ---
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", 3600))
 
-# --- misc constants ---
 MAX_MESSAGE_ID_LEN = 255
 
 def create_empty_response(message_id: str) -> dict:
@@ -78,7 +74,6 @@ def create_empty_response(message_id: str) -> dict:
         "prompt_tokens": 0,
     }
 
-# ========== 域名限流辅助 ==========
 
 def check_and_incr_domain_limit(rds: redis.Redis, domain: str, limit: int) -> bool:
     """Return True if send is allowed, False if over limit."""
@@ -88,7 +83,6 @@ def check_and_incr_domain_limit(rds: redis.Redis, domain: str, limit: int) -> bo
         rds.expire(key, RATE_LIMIT_WINDOW)
     return current <= limit
 
-# ========== 数据库存取 ==========
 
 def save_chat_log(
     db_conn,
@@ -104,7 +98,6 @@ def save_chat_log(
     total_tokens: int,
 ):
     try:
-        # 截断 message_id（如果超出）
         if message_id and len(message_id) > MAX_MESSAGE_ID_LEN:
             logger.warning(f"message_id 超过 {MAX_MESSAGE_ID_LEN} 字符，将被截断：{message_id}")
             message_id = message_id[:MAX_MESSAGE_ID_LEN]
@@ -133,7 +126,6 @@ def save_chat_log(
         db_conn.rollback()
         raise
 
-# ========== 函数 ==========
 
 def connect_with_retry(db_config, retries=5, delay=2):
     for attempt in range(1, retries + 1):
@@ -149,7 +141,6 @@ def connect_with_retry(db_config, retries=5, delay=2):
                 logger.critical("🚨 All MySQL connection retries failed.")
                 raise
 
-# --- SMTP accounts loader ---
 
 def load_and_map_smtp_accounts():
     smtp_accounts: dict[str, dict] = {}
@@ -174,7 +165,6 @@ def load_and_map_smtp_accounts():
     logger.info(f"Loaded SMTP accounts: {list(smtp_accounts.keys())}")
     return smtp_accounts
 
-# ========== 🔁 HTTP AI 回复接口 ==========
 
 def fetch_ai_reply(email_data: dict):
     api_url = os.getenv("AI_API_URL")
@@ -186,7 +176,6 @@ def fetch_ai_reply(email_data: dict):
         return create_empty_response(email_data.get("message_id") or f"email_{email_data['email_id']}")
 
     processed_text = raw_content
-    # ---- 净化邮件内容，去掉引用 ----
     separator_patterns = [
         re.compile(r".*?(原始邮件|Original Message).*?", re.IGNORECASE),
         re.compile(r"(?:From|发件人|Sent|发送时间|收件人|Subject|主题)\s*[:：].*", re.IGNORECASE | re.MULTILINE),
@@ -225,7 +214,6 @@ def fetch_ai_reply(email_data: dict):
     resp.raise_for_status()
     return resp.json()
 
-# ========== 发邮件 ==========
 
 def send_auto_reply(to_user_email: str, smtp_cfg: dict, reply_text: str, *, original_message_id: str | None = None, html: bool = False):
     subtype = 'html' if html else 'plain'
@@ -251,8 +239,6 @@ def send_auto_reply(to_user_email: str, smtp_cfg: dict, reply_text: str, *, orig
     finally:
         if server:
             server.quit()
-
-# ========== 拉取邮件记录 ==========
 
 def process_email(db_conn, db_cursor, email_id: int):
     sql_select = "SELECT from_email, to_email, content, is_processed, message_id FROM emails WHERE email_id=%s"
@@ -283,7 +269,6 @@ def process_email(db_conn, db_cursor, email_id: int):
     }
     return email_data, smtp_cfg
 
-# ========== 处理并发送 ==========
 
 def process_with_retry(db_conn, db_cursor, rds: redis.Redis, email_data: dict, smtp_cfg: dict, email_id: int):
     """Core pipeline: fetch AI, domain rate‑limit, send reply, log DB, mark processed."""
@@ -293,19 +278,15 @@ def process_with_retry(db_conn, db_cursor, rds: redis.Redis, email_data: dict, s
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # === 域名限流检查 ===
             if domain_limit:
                 allowed = check_and_incr_domain_limit(rds, to_domain, domain_limit)
                 if not allowed:
                     raise RuntimeError(f"Rate‑limit hit for {to_domain}: >{domain_limit}/{RATE_LIMIT_WINDOW}s")
-
-            # === 拉 AI 回复 ===
             data = fetch_ai_reply(email_data)
             response_text = data.get("response_text")
             if not response_text:
                 raise ValueError(f"response_text is empty for message_id={email_data.get('message_id')}")
 
-            # === 发送邮件 ===
             send_auto_reply(
                 email_data['from_email'],
                 smtp_cfg,
@@ -313,7 +294,6 @@ def process_with_retry(db_conn, db_cursor, rds: redis.Redis, email_data: dict, s
                 original_message_id=email_data.get('message_id'),
             )
 
-            # === 写聊天日志 ===
             save_chat_log(
                 db_conn,
                 message_id=data["message_id"],
@@ -343,10 +323,8 @@ def process_with_retry(db_conn, db_cursor, rds: redis.Redis, email_data: dict, s
             return  # success
 
         except RuntimeError as e:
-            # 专门处理 Rate‑limit
             if "Rate‑limit hit" in str(e):
                 logger.warning(e)
-                # 暂停一段时间再重试（或者直接 break）
                 time.sleep(RATE_LIMIT_WINDOW / max(domain_limit, 1))
                 continue
             else:
@@ -365,8 +343,6 @@ def process_with_retry(db_conn, db_cursor, rds: redis.Redis, email_data: dict, s
             time.sleep(RETRY_INTERVAL)
         else:
             logger.critical(f"🚨 Max retries reached for email_id {email_id}, giving up.")
-
-# ========== 消费 Redis ==========
 
 def consume_tasks(db_conn, db_cursor, rds: redis.Redis):
     logger.info("Listening for email tasks from Redis queue…")
@@ -391,9 +367,6 @@ def consume_tasks(db_conn, db_cursor, rds: redis.Redis):
             logger.error(f"❌ Type: {type(e)} | Args: {e.args}")
             traceback.print_exc()
             time.sleep(5)
-
-# ========== 主程序入口 ==========
-
 def main():
     logger.info("Starting email auto-reply service…")
 
