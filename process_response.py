@@ -1,13 +1,11 @@
 """
-Email Auto‑Reply Service with Domain Rate‑Limiting
--------------------------------------------------
-* Adds per‑domain send‑rate limits (e.g. 20 mails/hour to qq.com).
-* Keeps all original features: Redis queue, MySQL logging, AI reply fetch, SMTP retries.
-* New ENV keys (examples):
-    RATE_LIMIT_QQ_COM=20             # messages per window
-    RATE_LIMIT_WINDOW_SECONDS=3600    # window length (seconds)
+Email Auto-Reply Service 
+------------------------
+* Simple email processing without rate limiting
+* Redis queue processing with auto-expiring reply tracking
+* MySQL logging and AI reply integration
 
-Author: ChatGPT (2025‑07‑06)
+Author: Updated 2025-10-01
 """
 
 from __future__ import annotations
@@ -48,6 +46,11 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB   = int(os.getenv("REDIS_DB", 0))
 REDIS_QUEUE = os.getenv("REDIS_QUEUE", "email_task_queue")
+REPLIED_EMAILS_SET = 'replied_emails_set'  # Redis Set to track replied emails
+REPLIED_TTL_DAYS = int(os.getenv("REPLIED_TTL_DAYS", 30))  # Auto expire after 30 days
+
+# 邮件内容清理开关
+ENABLE_EMAIL_CLEANING = os.getenv("ENABLE_EMAIL_CLEANING", "true").lower() == "true"
 
 DB_CONFIG = dict(
     host=os.getenv('DB_HOST'),
@@ -57,9 +60,6 @@ DB_CONFIG = dict(
     db=os.getenv('DB_NAME'),
     charset='utf8mb4'
 )
-
-# --- Rate‑limit window (seconds) ---
-RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", 3600))
 
 # --- misc constants ---
 MAX_MESSAGE_ID_LEN = 255
@@ -76,25 +76,39 @@ def create_empty_response(message_id: str) -> dict:
         "completion_tokens": 0,
         "total_tokens": 0,
         "prompt_tokens": 0,
+        "model": ""
     }
 
-# ========== 域名限流辅助 ==========
+# ========== Redis缓存管理 ==========
 
-def check_and_incr_domain_limit(rds: redis.Redis, domain: str, limit: int) -> bool:
-    """Return True if send is allowed, False if over limit."""
-    key = f"rate_limit:{domain}"
-    current = rds.incr(key)  # atomic INCR; creates key if absent
-    if current == 1:
-        rds.expire(key, RATE_LIMIT_WINDOW)
-    return current <= limit
+def add_to_replied_cache(rds: redis.Redis, email_uuid: str):
+    """Add email UUID to replied cache with TTL for auto-expiration"""
+    ttl_seconds = REPLIED_TTL_DAYS * 24 * 3600  # Convert days to seconds
+    
+    # Add to set and set TTL for the entire set
+    rds.sadd(REPLIED_EMAILS_SET, email_uuid)
+    rds.expire(REPLIED_EMAILS_SET, ttl_seconds)
+    
+    # Also set individual key with TTL as backup
+    key = f"replied:{email_uuid}"
+    rds.setex(key, ttl_seconds, "1")
+
+def is_already_replied(rds: redis.Redis, email_uuid: str) -> bool:
+    """Check if email has been replied to using both methods"""
+    # Check in set first (faster)
+    if rds.sismember(REPLIED_EMAILS_SET, email_uuid):
+        return True
+    
+    # Check individual key as backup
+    key = f"replied:{email_uuid}"
+    return rds.exists(key) > 0
 
 # ========== 数据库存取 ==========
 
-def save_chat_log(
+def save_ai_response_to_email(
     db_conn,
-    message_id: str,
+    email_uuid: str,
     user_text: str,
-    emotion: str,
     rag_docs: list[str],
     response_text: str,
     prompt: str,
@@ -102,34 +116,46 @@ def save_chat_log(
     prompt_tokens: int,
     completion_tokens: int,
     total_tokens: int,
+    processing_time_ms: int = None,
+    model: str = None
 ):
+    """Save AI response directly to emails table"""
     try:
-        # 截断 message_id（如果超出）
-        if message_id and len(message_id) > MAX_MESSAGE_ID_LEN:
-            logger.warning(f"message_id 超过 {MAX_MESSAGE_ID_LEN} 字符，将被截断：{message_id}")
-            message_id = message_id[:MAX_MESSAGE_ID_LEN]
         if not completion_id:
             completion_id = str(uuid.uuid4())
-        rag_text   = "\n".join(rag_docs)
+        rag_text = "\n".join(rag_docs)
         prompt_str = str(prompt)
 
         db_conn.ping(reconnect=True)
         with db_conn.cursor() as cursor:
             sql = """
-            INSERT INTO chat_logs (
-                message_id, user_text, emotion, rag_docs, response_text,
-                prompt, completion_id, prompt_tokens, completion_tokens, total_tokens
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            UPDATE emails SET 
+                ai_user_text = %s,
+                ai_rag_docs = %s,
+                ai_response_text = %s,
+                ai_prompt = %s,
+                ai_completion_id = %s,
+                ai_prompt_tokens = %s,
+                ai_completion_tokens = %s,
+                ai_total_tokens = %s,
+                ai_processing_time_ms = %s,
+                ai_model = %s,
+                ai_processed_at = NOW(),
+                is_processed = 1,
+                response_status = 1,
+                response_sent_at = NOW(),
+                updated_at = NOW()
+            WHERE uuid = %s
             """
             cursor.execute(sql, (
-                message_id, user_text, emotion, rag_text, response_text,
-                prompt_str, completion_id, prompt_tokens, completion_tokens, total_tokens,
+                user_text, rag_text, response_text, prompt_str, completion_id,
+                prompt_tokens, completion_tokens, total_tokens,
+                processing_time_ms, model, email_uuid
             ))
         db_conn.commit()
-        logger.info(f"✅ Saved chat log: message_id={message_id}, completion_id={completion_id}")
+        logger.info(f"✅ Saved AI response to email UUID {email_uuid[:8]}..., completion_id={completion_id}")
     except Exception as e:
-        logger.error(f"❌ Failed to save chat log: {e}", exc_info=True)
+        logger.error(f"❌ Failed to save AI response: {e}", exc_info=True)
         db_conn.rollback()
         raise
 
@@ -186,25 +212,125 @@ def fetch_ai_reply(email_data: dict):
         return create_empty_response(email_data.get("message_id") or f"email_{email_data['email_id']}")
 
     processed_text = raw_content
-    # ---- 净化邮件内容，去掉引用 ----
-    separator_patterns = [
-        re.compile(r".*?(原始邮件|Original Message).*?", re.IGNORECASE),
-        re.compile(r"(?:From|发件人|Sent|发送时间|收件人|Subject|主题)\s*[:：].*", re.IGNORECASE | re.MULTILINE),
-        re.compile(r"[-_]{20,}"),
-        re.compile(r"On\s.+?wrote\s*:", re.IGNORECASE),
-    ]
-    for pattern in separator_patterns:
-        split_result = pattern.split(processed_text, maxsplit=1)
-        if len(split_result) > 1:
-            processed_text = split_result[0]
-            break
+    
+    # 如果启用了邮件清理功能
+    if ENABLE_EMAIL_CLEANING:
+        # ---- 净化邮件内容，去掉引用和历史回复 ----
+        separator_patterns = [
+            # 常见的邮件分隔线
+            re.compile(r"[-_=]{10,}", re.MULTILINE),
+            re.compile(r"[*]{10,}", re.MULTILINE),
+            
+            # 原始邮件标识（中英文）
+            re.compile(r".*?(?:原始邮件|Original Message|原邮件|Original Email).*", re.IGNORECASE | re.MULTILINE),
+            re.compile(r".*?(?:-----\s*原文\s*-----)", re.IGNORECASE | re.MULTILINE),
+            re.compile(r".*?(?:-----\s*Original\s*-----)", re.IGNORECASE | re.MULTILINE),
+            
+            # 发件人信息行
+            re.compile(r"^\s*(?:From|发件人|发自|Sent by|寄件者)\s*[:：].*", re.IGNORECASE | re.MULTILINE),
+            re.compile(r"^\s*(?:To|收件人|发送给|Sent to|收件者)\s*[:：].*", re.IGNORECASE | re.MULTILINE),
+            re.compile(r"^\s*(?:Date|时间|日期|发送时间|Sent)\s*[:：].*", re.IGNORECASE | re.MULTILINE),
+            re.compile(r"^\s*(?:Subject|主题|标题|Re:|回复)\s*[:：].*", re.IGNORECASE | re.MULTILINE),
+            
+            # 表格形式的邮件头
+            re.compile(r"^\s*\|\s*(?:发件人|主题|原始邮件|Subject|From|To|Date)\s*\|", re.IGNORECASE | re.MULTILINE),
+            
+            # 回复/转发标识
+            re.compile(r".*?(?:在.*写道|wrote|writes|said|says)[:：]?\s*$", re.IGNORECASE | re.MULTILINE),
+            re.compile(r".*?(?:On.*wrote|在.*发表|在.*回复).*", re.IGNORECASE | re.MULTILINE),
+            
+            # Gmail/Outlook 风格分隔
+            re.compile(r"^\s*>+\s*.*", re.MULTILINE),  # 引用符号
+            re.compile(r".*?(?:Begin forwarded message|转发的邮件开始).*", re.IGNORECASE | re.MULTILINE),
+            
+            # 邮件签名分隔
+            re.compile(r"^\s*--\s*$", re.MULTILINE),
+            re.compile(r"^\s*___+\s*$", re.MULTILINE),
+            
+            # 时间戳格式
+            re.compile(r".*?(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}).*(?:wrote|发表|回复|说道).*", re.IGNORECASE | re.MULTILINE),
+            
+            # 移动设备发送标识
+            re.compile(r".*?(?:Sent from my|从我的.*发送|发自我的).*", re.IGNORECASE | re.MULTILINE),
+            
+            # 通用分隔标记
+            re.compile(r".*?(?:---+|===+|\*\*\*+).*(?:转发|回复|Forward|Reply).*", re.IGNORECASE | re.MULTILINE),
+        ]
+
+        # 应用分隔模式，只保留第一部分（当前邮件内容）
+        for pattern in separator_patterns:
+            split_result = pattern.split(processed_text, maxsplit=1)
+            if len(split_result) > 1:
+                processed_text = split_result[0]
+                logger.debug(f"Applied pattern: {pattern.pattern}")
+                break
+        
+        # 额外清理：移除空行过多的情况和引用行
+        lines = processed_text.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            # 跳过明显的引用行
+            if line.strip().startswith('>'):
+                continue
+            # 跳过只包含分隔符的行
+            if re.match(r'^\s*[-_=*]{3,}\s*$', line):
+                continue
+            # 跳过邮件头信息行
+            if re.match(r'^\s*(?:From|To|Date|Subject|发件人|收件人|日期|主题)\s*[:：]', line, re.IGNORECASE):
+                continue
+            
+            cleaned_lines.append(line)
+        
+        # 重新组合，限制连续空行
+        processed_text = '\n'.join(cleaned_lines)
+        # 将多个连续换行符替换为最多两个
+        processed_text = re.sub(r'\n{3,}', '\n\n', processed_text)
+        
+        logger.debug(f"Email content cleaned, original length: {len(raw_content)}, cleaned length: {len(processed_text)}")
+    else:
+        logger.debug("Email cleaning disabled, using raw content")
+    
     processed_text = processed_text.strip()
     if not processed_text:
-        return create_empty_response(email_data.get("message_id") or f"email_{email_data['email_id']}")
+        return create_empty_response(email_data.get("message_id") or f"email_{email_data.get('email_uuid', 'unknown')}")
+
+    # 准备附件信息
+    attachments = []
+    if email_data.get('has_attachment') and email_data.get('attachment_info'):
+        try:
+            import json
+            attachment_info = email_data.get('attachment_info')
+            if isinstance(attachment_info, str):
+                attachments = json.loads(attachment_info)
+            elif isinstance(attachment_info, list):
+                attachments = attachment_info
+            
+            # 提取附件URL列表
+            attachment_urls = []
+            for att in attachments:
+                if isinstance(att, dict) and att.get('url'):
+                    attachment_urls.append({
+                        'url': att['url'],
+                        'filename': att.get('filename', 'unknown'),
+                        'type': att.get('content_type', 'unknown'),
+                        'size': att.get('size', 0)
+                    })
+            
+            if attachment_urls:
+                logger.info(f"Found {len(attachment_urls)} attachment(s) to send to AI")
+                
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(f"Failed to parse attachment info: {e}")
+            attachment_urls = []
+    else:
+        attachment_urls = []
 
     payload = {
-        "message_id": email_data.get("message_id") or f"email_{email_data['email_id']}",
+        "message_id": email_data.get("message_id") or f"email_{email_data.get('email_uuid', 'unknown')}",
         "text": processed_text,
+        "attachments": attachment_urls,  # 添加附件URL信息
+        "has_attachments": len(attachment_urls) > 0  # 附件标识
     }
 
     session = getattr(fetch_ai_reply, "_session", None)
@@ -254,8 +380,52 @@ def send_auto_reply(to_user_email: str, smtp_cfg: dict, reply_text: str, *, orig
 
 # ========== 拉取邮件记录 ==========
 
+def process_email_by_uuid(db_conn, db_cursor, email_uuid: str):
+    """Process email by UUID using new schema"""
+    sql_select = """
+        SELECT uuid, from_email, to_email, content, is_processed, message_id, 
+               subject, has_attachment, attachment_info
+        FROM emails 
+        WHERE uuid = %s
+    """
+    db_conn.ping(reconnect=True)
+    db_cursor.execute(sql_select, (email_uuid,))
+    row = db_cursor.fetchone()
+    if not row:
+        logger.warning(f"❓ Email with UUID {email_uuid[:8]}... not found in database.")
+        return None
+
+    uuid_val, from_email, to_email, content, is_processed, message_id, subject, has_attachment, attachment_info = row
+    if is_processed:
+        logger.info(f"⏩ Email UUID {email_uuid[:8]}... has already been processed.")
+        return None
+
+    to_email_norm = to_email.strip().lower()
+    smtp_cfg = SMTP_ACCOUNTS.get(to_email_norm) or SMTP_ACCOUNTS.get('jesse0526@officalbusiness.com')
+    if not smtp_cfg:
+        logger.warning(f"🤷 No SMTP config found for to_email='{to_email_norm}' (UUID: {email_uuid[:8]}...).")
+        return None
+
+    email_data = {
+        'from_email': from_email,
+        'to_email': to_email,
+        'content': content,
+        'subject': subject,
+        'email_uuid': email_uuid,
+        'message_id': message_id,
+        'has_attachment': has_attachment,
+        'attachment_info': attachment_info
+    }
+    return email_data, smtp_cfg
+
 def process_email(db_conn, db_cursor, email_id: int):
-    sql_select = "SELECT from_email, to_email, content, is_processed, message_id FROM emails WHERE email_id=%s"
+    """Legacy function for processing by email_id - kept for backward compatibility"""
+    sql_select = """
+        SELECT uuid, from_email, to_email, content, is_processed, message_id,
+               subject, has_attachment, attachment_info
+        FROM emails 
+        WHERE id = %s
+    """
     db_conn.ping(reconnect=True)
     db_cursor.execute(sql_select, (email_id,))
     row = db_cursor.fetchone()
@@ -263,7 +433,7 @@ def process_email(db_conn, db_cursor, email_id: int):
         logger.warning(f"❓ Email_id {email_id} not found in database.")
         return None
 
-    from_email, to_email, content, is_processed, message_id = row
+    uuid_val, from_email, to_email, content, is_processed, message_id, subject, has_attachment, attachment_info = row
     if is_processed:
         logger.info(f"⏩ Email_id {email_id} has already been processed.")
         return None
@@ -278,32 +448,30 @@ def process_email(db_conn, db_cursor, email_id: int):
         'from_email': from_email,
         'to_email': to_email,
         'content': content,
-        'email_id': email_id,
+        'subject': subject,
+        'email_uuid': uuid_val,
         'message_id': message_id,
+        'has_attachment': has_attachment,
+        'attachment_info': attachment_info
     }
     return email_data, smtp_cfg
 
 # ========== 处理并发送 ==========
 
-def process_with_retry(db_conn, db_cursor, rds: redis.Redis, email_data: dict, smtp_cfg: dict, email_id: int):
-    """Core pipeline: fetch AI, domain rate‑limit, send reply, log DB, mark processed."""
-    to_domain = email_data['from_email'].split('@')[-1].lower()
-    env_key   = f"RATE_LIMIT_{to_domain.replace('.', '_').upper()}"
-    domain_limit = int(os.getenv(env_key, 0))  # 0 → no limit
+def process_with_retry_uuid(db_conn, db_cursor, rds: redis.Redis, email_data: dict, smtp_cfg: dict):
+    """Core pipeline with UUID support: fetch AI, send reply, log DB, mark processed."""
+    email_uuid = email_data.get('email_uuid')
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # === 域名限流检查 ===
-            if domain_limit:
-                allowed = check_and_incr_domain_limit(rds, to_domain, domain_limit)
-                if not allowed:
-                    raise RuntimeError(f"Rate‑limit hit for {to_domain}: >{domain_limit}/{RATE_LIMIT_WINDOW}s")
-
             # === 拉 AI 回复 ===
+            start_time = time.time()
             data = fetch_ai_reply(email_data)
+            processing_time_ms = int((time.time() - start_time) * 1000)
+            
             response_text = data.get("response_text")
             if not response_text:
-                raise ValueError(f"response_text is empty for message_id={email_data.get('message_id')}")
+                raise ValueError(f"response_text is empty for email UUID {email_uuid[:8]}...")
 
             # === 发送邮件 ===
             send_auto_reply(
@@ -313,58 +481,103 @@ def process_with_retry(db_conn, db_cursor, rds: redis.Redis, email_data: dict, s
                 original_message_id=email_data.get('message_id'),
             )
 
-            # === 写聊天日志 ===
-            save_chat_log(
+            # === 保存AI响应到邮件表 ===
+            save_ai_response_to_email(
                 db_conn,
-                message_id=data["message_id"],
-                user_text=data["user_text"],
-                emotion=data["emotion"],
-                rag_docs=data["rag_docs"],
+                email_uuid=email_uuid,
+                user_text=data.get("user_text", ""),
+                rag_docs=data.get("rag_docs", []),
                 response_text=response_text,
                 prompt=email_data.get("content", ""),
-                completion_id=data["completion_id"],
-                prompt_tokens=data["prompt_tokens"],
-                completion_tokens=data["completion_tokens"],
-                total_tokens=data["total_tokens"],
+                completion_id=data.get("completion_id", ""),
+                prompt_tokens=data.get("prompt_tokens", 0),
+                completion_tokens=data.get("completion_tokens", 0),
+                total_tokens=data.get("total_tokens", 0),
+                processing_time_ms=processing_time_ms,
+                model=data.get("model", "")
             )
-
-            # === 标记已处理 ===
-            sql_update = """
-                UPDATE emails
-                   SET is_processed = 1,
-                       response = %s,
-                       response_time = NOW()
-                 WHERE email_id = %s
-            """
-            db_conn.ping(reconnect=True)
-            db_cursor.execute(sql_update, (response_text, email_id))
-            db_conn.commit()
-            logger.info(f"✅ Replied and marked email_id {email_id} as processed. (Attempt {attempt})")
+            
+            # === 添加到已回复缓存（带TTL自动淘汰） ===
+            add_to_replied_cache(rds, email_uuid)
+            logger.info(f"📝 Added email UUID {email_uuid[:8]}... to replied cache")
+            
+            logger.info(f"✅ Replied and marked email UUID {email_uuid[:8]}... as processed. (Attempt {attempt})")
             return  # success
 
-        except RuntimeError as e:
-            # 专门处理 Rate‑limit
-            if "Rate‑limit hit" in str(e):
-                logger.warning(e)
-                # 暂停一段时间再重试（或者直接 break）
-                time.sleep(RATE_LIMIT_WINDOW / max(domain_limit, 1))
-                continue
-            else:
-                logger.error(e)
         except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout) as e:
-            logger.error(f"❌ SMTP Connection Error on attempt {attempt} for email_id {email_id}: {e}")
+            logger.error(f"❌ SMTP Connection Error on attempt {attempt} for email UUID {email_uuid[:8]}...: {e}")
         except smtplib.SMTPAuthenticationError as e:
             logger.error(f"❌ SMTP Auth Error for {smtp_cfg['smtp_user']}: {e}")
             break  # credential wrong, no further retries
         except Exception as e:
-            logger.error(f"❌ Unexpected error on attempt {attempt} for email_id {email_id}: {e}")
+            logger.error(f"❌ Unexpected error on attempt {attempt} for email UUID {email_uuid[:8]}...: {e}")
 
         db_conn.rollback()
         if attempt < MAX_RETRIES:
             logger.info(f"Retrying in {RETRY_INTERVAL} seconds...")
             time.sleep(RETRY_INTERVAL)
         else:
-            logger.critical(f"🚨 Max retries reached for email_id {email_id}, giving up.")
+            logger.critical(f"🚨 Max retries reached for email UUID {email_uuid[:8]}..., giving up.")
+
+def process_with_retry(db_conn, db_cursor, rds: redis.Redis, email_data: dict, smtp_cfg: dict, email_uuid: str):
+    """Core pipeline for legacy compatibility: fetch AI, send reply, log DB, mark processed."""
+    
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # === 拉 AI 回复 ===
+            start_time = time.time()
+            data = fetch_ai_reply(email_data)
+            processing_time_ms = int((time.time() - start_time) * 1000)
+            
+            response_text = data.get("response_text")
+            if not response_text:
+                raise ValueError(f"response_text is empty for email UUID {email_uuid[:8]}...")
+
+            # === 发送邮件 ===
+            send_auto_reply(
+                email_data['from_email'],
+                smtp_cfg,
+                response_text,
+                original_message_id=email_data.get('message_id'),
+            )
+
+            # === 保存AI响应到邮件表 ===
+            save_ai_response_to_email(
+                db_conn,
+                email_uuid=email_uuid,
+                user_text=data.get("user_text", ""),
+                rag_docs=data.get("rag_docs", []),
+                response_text=response_text,
+                prompt=email_data.get("content", ""),
+                completion_id=data.get("completion_id", ""),
+                prompt_tokens=data.get("prompt_tokens", 0),
+                completion_tokens=data.get("completion_tokens", 0),
+                total_tokens=data.get("total_tokens", 0),
+                processing_time_ms=processing_time_ms,
+                model=data.get("model", "")
+            )
+            
+            # === 添加到已回复缓存（带TTL自动淘汰） ===
+            add_to_replied_cache(rds, email_uuid)
+            logger.info(f"📝 Added email UUID {email_uuid[:8]}... to replied cache")
+            
+            logger.info(f"✅ Replied and marked email UUID {email_uuid[:8]}... as processed. (Attempt {attempt})")
+            return  # success
+
+        except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout) as e:
+            logger.error(f"❌ SMTP Connection Error on attempt {attempt} for email UUID {email_uuid[:8]}...: {e}")
+        except smtplib.SMTPAuthenticationError as e:
+            logger.error(f"❌ SMTP Auth Error for {smtp_cfg['smtp_user']}: {e}")
+            break  # credential wrong, no further retries
+        except Exception as e:
+            logger.error(f"❌ Unexpected error on attempt {attempt} for email UUID {email_uuid[:8]}...: {e}")
+
+        db_conn.rollback()
+        if attempt < MAX_RETRIES:
+            logger.info(f"Retrying in {RETRY_INTERVAL} seconds...")
+            time.sleep(RETRY_INTERVAL)
+        else:
+            logger.critical(f"🚨 Max retries reached for email UUID {email_uuid[:8]}..., giving up.")
 
 # ========== 消费 Redis ==========
 
@@ -376,17 +589,40 @@ def consume_tasks(db_conn, db_cursor, rds: redis.Redis):
             if item is None:
                 continue  # queue idle
 
-            _, email_id_bytes = item
-            email_id_str = email_id_bytes.decode('utf-8')
-            email_id = int(email_id_str)
+            _, task_bytes = item
+            task_str = task_bytes.decode('utf-8')
+            
+            # 尝试判断是UUID还是旧的email_id格式
+            try:
+                # 如果可以转换为int，说明是旧格式的email_id
+                email_id = int(task_str)
+                logger.info(f"Processing legacy email_id format: {email_id}")
+                result = process_email(db_conn, db_cursor, email_id)
+                if result:
+                    email_data, smtp_cfg = result
+                    email_uuid = email_data.get('email_uuid')
+                    
+                    # 检查是否已经回复过（使用新的缓存检查）
+                    if email_uuid and is_already_replied(rds, email_uuid):
+                        logger.info(f"⏭️ Email UUID {email_uuid[:8]}... already replied, skipping.")
+                        continue
+                    
+                    process_with_retry(db_conn, db_cursor, rds, email_data, smtp_cfg, email_uuid)
+            except ValueError:
+                # 不能转换为int，说明是UUID格式
+                email_uuid = task_str
+                logger.info(f"Processing UUID format: {email_uuid[:8]}...")
+                
+                # 检查是否已经回复过（使用新的缓存检查）
+                if is_already_replied(rds, email_uuid):
+                    logger.info(f"⏭️ Email UUID {email_uuid[:8]}... already replied, skipping.")
+                    continue
+                    
+                result = process_email_by_uuid(db_conn, db_cursor, email_uuid)
+                if result:
+                    email_data, smtp_cfg = result
+                    process_with_retry_uuid(db_conn, db_cursor, rds, email_data, smtp_cfg)
 
-            result = process_email(db_conn, db_cursor, email_id)
-            if result:
-                email_data, smtp_cfg = result
-                process_with_retry(db_conn, db_cursor, rds, email_data, smtp_cfg, email_id)
-
-        except (ValueError, TypeError):
-            logger.error(f"Invalid message format in queue: {email_id_str}. Message should be an integer ID.")
         except Exception as e:
             logger.error(f"❌ Type: {type(e)} | Args: {e.args}")
             traceback.print_exc()
